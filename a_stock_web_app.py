@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
+# Updated: 2024-01-25
 import streamlit as st
-import akshare as ak
+import tushare as ts
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -11,7 +12,14 @@ import os
 import time
 import signal
 import platform
+import requests
+import json
 warnings.filterwarnings('ignore')
+
+# Tushare配置
+TUSHARE_TOKEN = "24da0172cad3d5fd1d40cbcb7049c6f69ad4230d707ead59324f25bf"
+ts.set_token(TUSHARE_TOKEN)
+pro = ts.pro_api()
 
 # 完全禁用代理设置，解决网络连接问题
 os.environ['HTTP_PROXY'] = ''
@@ -61,23 +69,30 @@ def calculate_kelly_position(win_rate, avg_win, avg_loss):
     kelly_fraction = (win_rate * avg_win - (1 - win_rate) * avg_loss) / avg_win
     return max(0.1, min(0.9, kelly_fraction))  # 限制在10%-90%之间
 
-@st.cache_data(ttl=86400)
+@st.cache_data(ttl=86400)  # 缓存24小时
 def get_real_fundamental_data(stock_code):
-    """获取真实基本面数据，缓存24小时"""
+    """获取真实基本面数据，使用Tushare fina_indicator接口"""
     try:
-        # 获取最新财报数据
-        # 使用akshare的财报接口
-        financial_data = ak.stock_financial_abstract(stock=stock_code)
+        # 转换股票代码格式
+        if stock_code.startswith('0') or stock_code.startswith('3'):
+            ts_code = f"{stock_code}.SZ"
+        elif stock_code.startswith('6'):
+            ts_code = f"{stock_code}.SH"
+        else:
+            ts_code = stock_code
         
-        if financial_data is not None and not financial_data.empty:
+        # 使用财务指标接口获取数据
+        indi = pro.fina_indicator(ts_code=ts_code)
+        
+        if indi is not None and not indi.empty:
             # 获取最新一期数据
-            latest_data = financial_data.iloc[0]
+            s = indi.sort_values('end_date', ascending=False).iloc[0]
             
-            # 提取关键指标
-            roe = float(latest_data.get('净资产收益率', 15.0) or 15.0)
-            revenue_growth = float(latest_data.get('营业收入同比增长率', 10.0) or 10.0)
-            profit_growth = float(latest_data.get('净利润同比增长率', 15.0) or 15.0)
-            cash_flow = float(latest_data.get('经营活动产生的现金流量净额', 1.0) or 1.0) / 100000000  # 转换为亿元
+            # 提取关键指标，使用正确的字段名
+            roe = float(s.get('roe', 15.0) or 15.0)
+            revenue_growth = float(s.get('or_yoy', 10.0) or 10.0)  # 营收同比
+            profit_growth = float(s.get('q_dtprofit_yoy', 15.0) or 15.0)  # 归母净利同比（单季）
+            cash_flow = float(s.get('net_cash_flows_oper_act', 1.0) or 1.0) / 1e8  # 亿元
             
             return {
                 'roe': roe,
@@ -144,7 +159,7 @@ def calculate_position_size(method, win_rate=0.5, avg_win=0.1, avg_loss=0.05, ri
 
 @st.cache_data(ttl=5)
 def get_realtime_data_with_retry(stock_code, max_retries=3, timeout=10):
-    """实时数据获取：优先 akshare，备用新浪，带重试和明确告警"""
+    """实时数据获取：优先 Tushare，备用新浪，带重试和明确告警"""
     import requests
     from requests.adapters import HTTPAdapter
     from urllib3.util.retry import Retry
@@ -164,23 +179,41 @@ def get_realtime_data_with_retry(stock_code, max_retries=3, timeout=10):
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114 Safari/537.36'
     }
     
-    # 1) 优先：akshare eastmoney 全市场快照
+    # 1) 优先：Tushare 实时数据
     for attempt in range(max_retries):
         try:
-            df = ak.stock_zh_a_spot_em()
-            if df is not None and not df.empty and '代码' in df.columns:
-                row = df[df['代码'] == stock_code]
-                if not row.empty:
-                    r = row.iloc[0]
-                    return {
-                        '最新价': float(r.get('最新价', 0) or 0),
-                        '涨跌幅': float(r.get('涨跌幅', 0) or 0),
-                        '成交量': int(r.get('成交量', 0) or 0),
-                        '成交额': float(r.get('成交额', 0) or 0)
-                    }
-            st.info(f"未在快照中找到代码 {stock_code}，尝试备用源 (第{attempt+1}次)")
+            # 转换股票代码格式
+            if stock_code.startswith('0') or stock_code.startswith('3'):
+                ts_code = f"{stock_code}.SZ"
+            elif stock_code.startswith('6'):
+                ts_code = f"{stock_code}.SH"
+            else:
+                ts_code = stock_code
+            
+            # 获取最近交易日数据（避免周末/节假日无数据问题）
+            today = datetime.now()
+            # 获取最近5个交易日的数据，然后取最新的
+            start_date = (today - timedelta(days=7)).strftime('%Y%m%d')
+            end_date = today.strftime('%Y%m%d')
+            data = pro.daily(ts_code=ts_code, 
+                           start_date=start_date, 
+                           end_date=end_date,
+                           fields='ts_code,trade_date,open,high,low,close,vol,amount,pct_chg')
+            
+            # 如果有数据，取最新的交易日数据
+            if data is not None and not data.empty:
+                data = data.sort_values('trade_date', ascending=False)
+                row = data.iloc[0]  # 取最新一条
+                return {
+                    '最新价': float(row.get('close', 0) or 0),
+                    '涨跌幅': float(row.get('pct_chg', 0) or 0),
+                    '成交量': int(row.get('vol', 0) or 0),
+                    '成交额': float(row.get('amount', 0) or 0)
+                }
+            
+            st.info(f"Tushare未找到今日数据 {stock_code}，尝试备用源 (第{attempt+1}次)")
         except Exception as e:
-            st.warning(f"akshare 实时数据失败(第{attempt+1}次): {str(e)}")
+            st.warning(f"Tushare 实时数据失败(第{attempt+1}次): {str(e)}")
         time.sleep(0.5)
     
     # 2) 备用：新浪简易接口（gbk 编码）
@@ -209,42 +242,54 @@ def get_realtime_data_with_retry(stock_code, max_retries=3, timeout=10):
     return None
 
 def get_stock_data_with_retry(stock_code, start_date, end_date, max_retries=2):
-    """多源历史数据获取：Akshare → Tushare → 新浪"""
+    """多源历史数据获取：Tushare → 模拟数据"""
     
-    # 1) 优先：Akshare
+    # 1) 优先：Tushare
     for attempt in range(max_retries):
         try:
-            data = ak.stock_zh_a_hist(symbol=stock_code, period="daily", 
+            # 转换股票代码格式 (如: 000001 -> 000001.SZ)
+            if stock_code.startswith('0') or stock_code.startswith('3'):
+                ts_code = f"{stock_code}.SZ"
+            elif stock_code.startswith('6'):
+                ts_code = f"{stock_code}.SH"
+            else:
+                ts_code = stock_code
+            
+            # 获取日线数据（添加fields参数提高效率）
+            data = pro.daily(ts_code=ts_code, 
                                      start_date=start_date.strftime('%Y%m%d'),
-                                     end_date=end_date.strftime('%Y%m%d'))
+                                     end_date=end_date.strftime('%Y%m%d'),
+                                     fields='ts_code,trade_date,open,high,low,close,vol,amount')
             
             if data is not None and not data.empty:
+                # 重命名列以匹配原有格式
+                data = data.rename(columns={
+                    'trade_date': '日期',
+                    'open': '开盘',
+                    'high': '最高', 
+                    'low': '最低',
+                    'close': '收盘',
+                    'vol': '成交量'
+                })
+                
+                # 转换日期格式
+                data['日期'] = pd.to_datetime(data['日期'], format='%Y%m%d').dt.strftime('%Y-%m-%d')
+                
+                # 按日期排序
+                data = data.sort_values('日期').reset_index(drop=True)
+                
                 required_cols = ['日期', '开盘', '最高', '最低', '收盘', '成交量']
                 if all(col in data.columns for col in required_cols):
+                    st.success(f"✅ Tushare数据获取成功: {stock_code}")
                     return data
             
-            st.info(f"Akshare数据获取失败(第{attempt+1}次)，尝试备用源...")
+            st.info(f"Tushare数据获取失败(第{attempt+1}次)，尝试备用源...")
         except Exception as e:
-            st.warning(f"Akshare失败(第{attempt+1}次): {str(e)}")
+            st.warning(f"Tushare失败(第{attempt+1}次): {str(e)}")
         time.sleep(0.5)
     
-    # 2) 备用：Tushare (如果有配置)
-    try:
-        # 这里可以添加Tushare接口，但需要token
-        st.info("Tushare接口需要配置token，跳过...")
-    except Exception as e:
-        st.warning(f"Tushare数据获取失败: {str(e)}")
-    
-    # 3) 备用：新浪财经接口
-    try:
-        import requests
-        # 这里可以添加新浪财经历史数据接口
-        st.info("新浪财经历史数据接口暂未实现，使用模拟数据...")
-    except Exception as e:
-        st.warning(f"新浪数据获取失败: {str(e)}")
-    
-    # 4) 兜底：模拟数据
-    st.warning("所有数据源失败，使用模拟数据进行演示")
+    # 2) 兜底：模拟数据
+    st.warning("Tushare数据源失败，使用模拟数据进行演示")
     return generate_mock_data(start_date, end_date)
 
 def generate_mock_data(start_date, end_date):
@@ -287,9 +332,9 @@ def generate_mock_data(start_date, end_date):
 
 # 指数代码映射字典
 INDEX_MAP = {
-    "沪深300指数": "sh000300",
-    "中证500指数": "sh000905",
-    "创业板指": "sz399006"
+    "沪深300指数": "000300.SH",
+    "中证500指数": "000905.SH", 
+    "创业板指": "399006.SZ"
 }
 
 def get_index_series(name, start, end):
@@ -299,13 +344,22 @@ def get_index_series(name, start, end):
             return None
         
         symbol = INDEX_MAP[name]
-        # 使用ak.stock_zh_index_daily_em获取指数数据
-        index_data = ak.stock_zh_index_daily_em(symbol=symbol, start_date=start.strftime('%Y%m%d'), end_date=end.strftime('%Y%m%d'))
+        # 使用Tushare获取指数数据（添加fields参数提高效率）
+        index_data = pro.index_daily(ts_code=symbol, 
+                                   start_date=start.strftime('%Y%m%d'), 
+                                   end_date=end.strftime('%Y%m%d'),
+                                   fields='ts_code,trade_date,open,high,low,close,vol,amount')
         
         if index_data is not None and not index_data.empty:
+            # 重命名列以匹配Tushare格式
+            index_data = index_data.rename(columns={
+                'trade_date': '日期',
+                'close': '收盘'
+            })
+            
             # 确保日期列存在且为datetime类型
             if '日期' in index_data.columns:
-                index_data['日期'] = pd.to_datetime(index_data['日期'])
+                index_data['日期'] = pd.to_datetime(index_data['日期'], format='%Y%m%d')
             elif 'date' in index_data.columns:
                 index_data['date'] = pd.to_datetime(index_data['date'])
                 index_data = index_data.rename(columns={'date': '日期'})
@@ -437,25 +491,25 @@ def backtest_one(code, params):
                 hist_data.loc[i, '仓位'] = 0.0
         
         # 计算交易成本和收益
-        hist_data['交易成本'] = 0.0
-        signal_change = hist_data['信号'].diff()
-        
-        # 买入时：只扣手续费和滑点
-        buy_signals = (signal_change == 1)
-        hist_data.loc[buy_signals, '交易成本'] = commission_rate + slippage_rate
-        
-        # 卖出时：扣手续费、滑点和印花税
-        sell_signals = (signal_change == -1)
-        hist_data.loc[sell_signals, '交易成本'] = commission_rate + slippage_rate + stamp_tax_rate
-        
         hist_data['收益率'] = hist_data['收盘'].pct_change()
         hist_data['策略收益'] = hist_data['信号'].shift(1) * hist_data['收益率'] * hist_data['仓位'].shift(1)
+        
+        # 交易成本：按换手×费率计算
+        signal_change = hist_data['信号'].diff().fillna(0)
+        turnover = signal_change.abs() * hist_data['仓位'].shift(1).fillna(0.0)
+        buy = (signal_change == 1)
+        sell = (signal_change == -1)
+        cost_rate = np.where(buy, commission_rate + slippage_rate, 0.0) + \
+                    np.where(sell, commission_rate + slippage_rate + stamp_tax_rate, 0.0)
+        hist_data['交易成本'] = turnover * cost_rate
+        
         hist_data['策略收益_after_fee'] = hist_data['策略收益'] - hist_data['交易成本']
         hist_data['累计收益'] = (1 + hist_data['策略收益_after_fee']).cumprod()
         
         # 计算关键指标
         total_return = hist_data['累计收益'].iloc[-1] - 1
-        annual_return = (hist_data['累计收益'].iloc[-1] ** (1 / backtest_years)) - 1
+        n = len(hist_data)
+        annual_return = hist_data['累计收益'].iloc[-1] ** (252.0 / n) - 1.0
         
         # 最大回撤
         cumulative_returns = hist_data['累计收益']
@@ -722,6 +776,7 @@ with st.sidebar:
     run_backtest = st.button("🎯 确定并开始回测", key="run_backtest_btn", type="primary", use_container_width=True)
     
     if run_backtest:
+        st.session_state.run_backtest = True
         st.success("✅ 参数确认，开始策略回测...")
     else:
         st.info("💡 请先设置好参数，然后点击上方按钮开始回测")
@@ -782,7 +837,7 @@ if stock_code:
             st.warning("实时数据获取失败，使用上次缓存/请稍后重试")
     
     # 只有点击确定按钮后才执行回测
-    if 'run_backtest' in locals() and run_backtest:
+    if st.session_state.get('run_backtest', False):
         with st.spinner("正在进行专业策略回测..."):
             try:
                 # 获取历史数据
@@ -894,84 +949,64 @@ if stock_code:
                                     hist_data.loc[i, '综合得分'] = hist_data.loc[i, '技术面得分']
                                 
                                 # 风险管理检查
+                                risk_triggered = False
                                 if prev_position > 0 and prev_buy_price > 0:
-                                    # 移动止损
-                                    if enable_trailing_stop:
-                                        new_trailing_stop = current_price * (1 - trailing_stop_percent)
-                                        if new_trailing_stop > hist_data.loc[i-1, '移动止损价格']:
-                                            hist_data.loc[i, '移动止损价格'] = new_trailing_stop
-                                        else:
-                                            hist_data.loc[i, '移动止损价格'] = hist_data.loc[i-1, '移动止损价格']
-                                        
-                                        if current_price <= hist_data.loc[i, '移动止损价格']:
-                                            hist_data.loc[i, '信号'] = 0
-                                            hist_data.loc[i, '仓位'] = 0.0
-                                            hist_data.loc[i, '风险信号'] = 4  # 移动止损
-                                            continue
-                                else:
-                                    # 固定止损止盈
-                                    if current_price <= hist_data.loc[i-1, '止损价格']:
-                                        hist_data.loc[i, '信号'] = 0
-                                        hist_data.loc[i, '仓位'] = 0.0
-                                        hist_data.loc[i, '风险信号'] = 1
-                                        continue
-                                    
+                                    # 止盈检查（无论是否启用移动止损都要检查）
                                     if current_price >= hist_data.loc[i-1, '止盈价格']:
                                         hist_data.loc[i, '信号'] = 0
                                         hist_data.loc[i, '仓位'] = 0.0
-                                        hist_data.loc[i, '风险信号'] = 2
-                                        continue
-                                
-                                # 最大回撤限制
-                                cumulative_return = (current_price / prev_buy_price - 1)
-                                if cumulative_return <= -max_drawdown_limit:
-                                    hist_data.loc[i, '信号'] = 0
-                                    hist_data.loc[i, '仓位'] = 0.0
-                                    hist_data.loc[i, '风险信号'] = 3
-                                    continue
-                            
-                            # 信号生成
-                            if signal_type == "金叉死叉":
-                                # 金叉死叉逻辑
-                                prev_fast = hist_data.loc[i-1, 'MA_fast']
-                                prev_slow = hist_data.loc[i-1, 'MA_slow']
-                                curr_fast = hist_data.loc[i, 'MA_fast']
-                                curr_slow = hist_data.loc[i, 'MA_slow']
-                                
-                                buy_condition = (prev_fast <= prev_slow) and (curr_fast > curr_slow)
-                                sell_condition = (prev_fast >= prev_slow) and (curr_fast < curr_slow)
-                                
-                                if buy_condition and hist_data.loc[i, '综合得分'] >= 0.5:
-                                    hist_data.loc[i, '信号'] = 1
-                                    # 计算仓位大小
-                                    if position_sizing_method == "Kelly公式":
-                                        position_size = calculate_position_size("Kelly公式", 0.5, 0.1, 0.05, risk_per_trade, initial_capital)
-                                        hist_data.loc[i, '仓位'] = min(position_size / initial_capital, max_position_size)
-                                    else:
-                                        hist_data.loc[i, '仓位'] = max_position_size
+                                        hist_data.loc[i, '风险信号'] = 2  # 止盈
+                                        risk_triggered = True
                                     
-                                    hist_data.loc[i, '买入价格'] = current_price
-                                    hist_data.loc[i, '止损价格'] = current_price * (1 - stop_loss)
-                                    hist_data.loc[i, '止盈价格'] = current_price * (1 + take_profit)
-                                    if enable_trailing_stop:
-                                        hist_data.loc[i, '移动止损价格'] = current_price * (1 - trailing_stop_percent)
-                                elif sell_condition:
-                                    hist_data.loc[i, '信号'] = 0
-                                    hist_data.loc[i, '仓位'] = 0.0
-                                else:
-                                    # 保持前一日状态
-                                    hist_data.loc[i, '信号'] = prev_signal
-                                    hist_data.loc[i, '仓位'] = prev_position
-                                    hist_data.loc[i, '买入价格'] = prev_buy_price
-                                    hist_data.loc[i, '止损价格'] = hist_data.loc[i-1, '止损价格']
-                                    hist_data.loc[i, '止盈价格'] = hist_data.loc[i-1, '止盈价格']
-                                    hist_data.loc[i, '移动止损价格'] = hist_data.loc[i-1, '移动止损价格']
-                            
-                            elif signal_type == "趋势跟踪":
-                                # 趋势跟踪逻辑
-                                if hist_data.loc[i, 'MA_fast'] > hist_data.loc[i, 'MA_slow'] and hist_data.loc[i, '综合得分'] >= 0.5:
-                                    if prev_signal == 0:  # 新开仓
+                                    # 止损检查
+                                    if not risk_triggered:
+                                        if enable_trailing_stop:
+                                            # 移动止损
+                                            new_trailing_stop = current_price * (1 - trailing_stop_percent)
+                                            if new_trailing_stop > hist_data.loc[i-1, '移动止损价格']:
+                                                hist_data.loc[i, '移动止损价格'] = new_trailing_stop
+                                            else:
+                                                hist_data.loc[i, '移动止损价格'] = hist_data.loc[i-1, '移动止损价格']
+                                            
+                                            if current_price <= hist_data.loc[i, '移动止损价格']:
+                                                hist_data.loc[i, '信号'] = 0
+                                                hist_data.loc[i, '仓位'] = 0.0
+                                                hist_data.loc[i, '风险信号'] = 4  # 移动止损
+                                                risk_triggered = True
+                                        else:
+                                            # 固定止损
+                                            if current_price <= hist_data.loc[i-1, '止损价格']:
+                                                hist_data.loc[i, '信号'] = 0
+                                                hist_data.loc[i, '仓位'] = 0.0
+                                                hist_data.loc[i, '风险信号'] = 1  # 固定止损
+                                                risk_triggered = True
+                                    
+                                    # 最大回撤限制
+                                    cumulative_return = (current_price / prev_buy_price - 1)
+                                    if cumulative_return <= -max_drawdown_limit:
+                                        hist_data.loc[i, '信号'] = 0
+                                        hist_data.loc[i, '仓位'] = 0.0
+                                        hist_data.loc[i, '风险信号'] = 3
+                                        risk_triggered = True
+                                
+                                # 如果风险触发，跳过信号生成
+                                if risk_triggered:
+                                    continue
+                                
+                                # 信号生成
+                                if signal_type == "金叉死叉":
+                                    # 金叉死叉逻辑
+                                    prev_fast = hist_data.loc[i-1, 'MA_fast']
+                                    prev_slow = hist_data.loc[i-1, 'MA_slow']
+                                    curr_fast = hist_data.loc[i, 'MA_fast']
+                                    curr_slow = hist_data.loc[i, 'MA_slow']
+                                    
+                                    buy_condition = (prev_fast <= prev_slow) and (curr_fast > curr_slow)
+                                    sell_condition = (prev_fast >= prev_slow) and (curr_fast < curr_slow)
+                                    
+                                    if buy_condition and hist_data.loc[i, '综合得分'] >= 0.5:
                                         hist_data.loc[i, '信号'] = 1
+                                        # 计算仓位大小
                                         if position_sizing_method == "Kelly公式":
                                             position_size = calculate_position_size("Kelly公式", 0.5, 0.1, 0.05, risk_per_trade, initial_capital)
                                             hist_data.loc[i, '仓位'] = min(position_size / initial_capital, max_position_size)
@@ -982,67 +1017,94 @@ if stock_code:
                                         hist_data.loc[i, '止损价格'] = current_price * (1 - stop_loss)
                                         hist_data.loc[i, '止盈价格'] = current_price * (1 + take_profit)
                                         if enable_trailing_stop:
-                                            hist_data.loc[i, '移动止损价格'] = current_price * (1 - trailing_stop_percent)
-                                    else:  # 保持持仓
-                                        hist_data.loc[i, '信号'] = 1
-                                        hist_data.loc[i, '仓位'] = prev_position
-                                        hist_data.loc[i, '买入价格'] = prev_buy_price
-                                        hist_data.loc[i, '止损价格'] = hist_data.loc[i-1, '止损价格']
-                                        hist_data.loc[i, '止盈价格'] = hist_data.loc[i-1, '止盈价格']
-                                        hist_data.loc[i, '移动止损价格'] = hist_data.loc[i-1, '移动止损价格']
-                                else:
-                                    hist_data.loc[i, '信号'] = 0
-                                    hist_data.loc[i, '仓位'] = 0.0
-                            
-                            elif signal_type == "多因子综合":
-                                # 多因子综合逻辑
-                                if hist_data.loc[i, '综合得分'] >= 0.7:  # 高得分买入
-                                    if prev_signal == 0:
-                                        hist_data.loc[i, '信号'] = 1
-                                        if position_sizing_method == "Kelly公式":
-                                            position_size = calculate_position_size("Kelly公式", 0.5, 0.1, 0.05, risk_per_trade, initial_capital)
-                                            hist_data.loc[i, '仓位'] = min(position_size / initial_capital, max_position_size)
-                                        else:
-                                            hist_data.loc[i, '仓位'] = max_position_size
-                                        
-                                        hist_data.loc[i, '买入价格'] = current_price
-                                        hist_data.loc[i, '止损价格'] = current_price * (1 - stop_loss)
-                                        hist_data.loc[i, '止盈价格'] = current_price * (1 + take_profit)
-                                        if enable_trailing_stop:
-                                            hist_data.loc[i, '移动止损价格'] = current_price * (1 - trailing_stop_percent)
+                                            hist_data.loc[i, '移动止损价格'] = current_price  # 初始移动止损价格为买入价格
+                                    elif sell_condition:
+                                        hist_data.loc[i, '信号'] = 0
+                                        hist_data.loc[i, '仓位'] = 0.0
                                     else:
-                                        hist_data.loc[i, '信号'] = 1
+                                        # 保持前一日状态
+                                        hist_data.loc[i, '信号'] = prev_signal
                                         hist_data.loc[i, '仓位'] = prev_position
                                         hist_data.loc[i, '买入价格'] = prev_buy_price
                                         hist_data.loc[i, '止损价格'] = hist_data.loc[i-1, '止损价格']
                                         hist_data.loc[i, '止盈价格'] = hist_data.loc[i-1, '止盈价格']
                                         hist_data.loc[i, '移动止损价格'] = hist_data.loc[i-1, '移动止损价格']
-                                elif hist_data.loc[i, '综合得分'] <= 0.3:  # 低得分卖出
-                                    hist_data.loc[i, '信号'] = 0
-                                    hist_data.loc[i, '仓位'] = 0.0
-                                else:
-                                    # 保持前一日状态
-                                    hist_data.loc[i, '信号'] = prev_signal
-                                    hist_data.loc[i, '仓位'] = prev_position
-                                    hist_data.loc[i, '买入价格'] = prev_buy_price
-                                    hist_data.loc[i, '止损价格'] = hist_data.loc[i-1, '止损价格']
-                                    hist_data.loc[i, '止盈价格'] = hist_data.loc[i-1, '止盈价格']
-                                    hist_data.loc[i, '移动止损价格'] = hist_data.loc[i-1, '移动止损价格']
+                                
+                                elif signal_type == "趋势跟踪":
+                                    # 趋势跟踪逻辑
+                                    if hist_data.loc[i, 'MA_fast'] > hist_data.loc[i, 'MA_slow'] and hist_data.loc[i, '综合得分'] >= 0.5:
+                                        if prev_signal == 0:  # 新开仓
+                                            hist_data.loc[i, '信号'] = 1
+                                            if position_sizing_method == "Kelly公式":
+                                                position_size = calculate_position_size("Kelly公式", 0.5, 0.1, 0.05, risk_per_trade, initial_capital)
+                                                hist_data.loc[i, '仓位'] = min(position_size / initial_capital, max_position_size)
+                                            else:
+                                                hist_data.loc[i, '仓位'] = max_position_size
+                                            
+                                            hist_data.loc[i, '买入价格'] = current_price
+                                            hist_data.loc[i, '止损价格'] = current_price * (1 - stop_loss)
+                                            hist_data.loc[i, '止盈价格'] = current_price * (1 + take_profit)
+                                            if enable_trailing_stop:
+                                                hist_data.loc[i, '移动止损价格'] = current_price  # 初始移动止损价格为买入价格
+                                        else:  # 保持持仓
+                                            hist_data.loc[i, '信号'] = 1
+                                            hist_data.loc[i, '仓位'] = prev_position
+                                            hist_data.loc[i, '买入价格'] = prev_buy_price
+                                            hist_data.loc[i, '止损价格'] = hist_data.loc[i-1, '止损价格']
+                                            hist_data.loc[i, '止盈价格'] = hist_data.loc[i-1, '止盈价格']
+                                            hist_data.loc[i, '移动止损价格'] = hist_data.loc[i-1, '移动止损价格']
+                                    else:
+                                        hist_data.loc[i, '信号'] = 0
+                                        hist_data.loc[i, '仓位'] = 0.0
+                            
+                                elif signal_type == "多因子综合":
+                                    # 多因子综合逻辑
+                                    if hist_data.loc[i, '综合得分'] >= 0.7:  # 高得分买入
+                                        if prev_signal == 0:
+                                            hist_data.loc[i, '信号'] = 1
+                                            if position_sizing_method == "Kelly公式":
+                                                position_size = calculate_position_size("Kelly公式", 0.5, 0.1, 0.05, risk_per_trade, initial_capital)
+                                                hist_data.loc[i, '仓位'] = min(position_size / initial_capital, max_position_size)
+                                            else:
+                                                hist_data.loc[i, '仓位'] = max_position_size
+                                            
+                                            hist_data.loc[i, '买入价格'] = current_price
+                                            hist_data.loc[i, '止损价格'] = current_price * (1 - stop_loss)
+                                            hist_data.loc[i, '止盈价格'] = current_price * (1 + take_profit)
+                                            if enable_trailing_stop:
+                                                hist_data.loc[i, '移动止损价格'] = current_price  # 初始移动止损价格为买入价格
+                                        else:
+                                            hist_data.loc[i, '信号'] = 1
+                                            hist_data.loc[i, '仓位'] = prev_position
+                                            hist_data.loc[i, '买入价格'] = prev_buy_price
+                                            hist_data.loc[i, '止损价格'] = hist_data.loc[i-1, '止损价格']
+                                            hist_data.loc[i, '止盈价格'] = hist_data.loc[i-1, '止盈价格']
+                                            hist_data.loc[i, '移动止损价格'] = hist_data.loc[i-1, '移动止损价格']
+                                    elif hist_data.loc[i, '综合得分'] <= 0.3:  # 低得分卖出
+                                        hist_data.loc[i, '信号'] = 0
+                                        hist_data.loc[i, '仓位'] = 0.0
+                                    else:
+                                        # 保持前一日状态
+                                        hist_data.loc[i, '信号'] = prev_signal
+                                        hist_data.loc[i, '仓位'] = prev_position
+                                        hist_data.loc[i, '买入价格'] = prev_buy_price
+                                        hist_data.loc[i, '止损价格'] = hist_data.loc[i-1, '止损价格']
+                                        hist_data.loc[i, '止盈价格'] = hist_data.loc[i-1, '止盈价格']
+                                        hist_data.loc[i, '移动止损价格'] = hist_data.loc[i-1, '移动止损价格']
                         
                         # 移动止损价格前向填充
                         hist_data['移动止损价格'] = hist_data['移动止损价格'].fillna(method='ffill')
                         
                         # 计算交易成本和收益
                         hist_data['交易成本'] = 0.0
-                        signal_change = hist_data['信号'].diff()
-                        
-                        # 买入时：只扣手续费和滑点
-                        buy_signals = (signal_change == 1)
-                        hist_data.loc[buy_signals, '交易成本'] = commission_rate + slippage_rate
-                        
-                        # 卖出时：扣手续费、滑点和印花税
-                        sell_signals = (signal_change == -1)
-                        hist_data.loc[sell_signals, '交易成本'] = commission_rate + slippage_rate + stamp_tax_rate
+                        # 交易成本：按换手×费率计算
+                        signal_change = hist_data['信号'].diff().fillna(0)
+                        turnover = signal_change.abs() * hist_data['仓位'].shift(1).fillna(0.0)
+                        buy = (signal_change == 1)
+                        sell = (signal_change == -1)
+                        cost_rate = np.where(buy, commission_rate + slippage_rate, 0.0) + \
+                                    np.where(sell, commission_rate + slippage_rate + stamp_tax_rate, 0.0)
+                        hist_data['交易成本'] = turnover * cost_rate
                 
                 hist_data['收益率'] = hist_data['收盘'].pct_change()
                 hist_data['策略收益'] = hist_data['信号'].shift(1) * hist_data['收益率'] * hist_data['仓位'].shift(1)
@@ -1053,9 +1115,14 @@ if stock_code:
                 if benchmark_type != "个股买入持有":
                     benchmark_data = get_benchmark_data(benchmark_type, start_date, end_date)
                     if benchmark_data is not None:
-                        # 使用新的累计收益序列
-                        hist_data['基准收益'] = benchmark_data['收益率']
-                        hist_data['基准累计收益'] = benchmark_data['累计收益']
+                        # 按日期对齐基准数据
+                        tmp = pd.DataFrame({'日期': pd.to_datetime(hist_data['日期'])})
+                        bench = benchmark_data.copy()
+                        bench['date'] = pd.to_datetime(bench['date'])
+                        merged = tmp.merge(bench[['date','收益率','累计收益']],
+                                         left_on='日期', right_on='date', how='left').ffill()
+                        hist_data['基准收益'] = merged['收益率'].values
+                        hist_data['基准累计收益'] = merged['累计收益'].values
                     else:
                         hist_data['基准收益'] = hist_data['收益率']
                         hist_data['基准累计收益'] = (1 + hist_data['收益率']).cumprod()
@@ -1070,8 +1137,9 @@ if stock_code:
                 # 对数收益率（更准确的风险计算）
                 log_returns = np.log(1 + strategy_returns)
                 
-                # 年化收益率
-                annual_return = (hist_data['累计收益'].iloc[-1] - 1) * 252 / len(hist_data)
+                # 年化收益率（几何年化）
+                n = len(hist_data)
+                annual_return = hist_data['累计收益'].iloc[-1] ** (252.0 / n) - 1.0
                 
                 # 年化波动率
                 annual_volatility = log_returns.std() * np.sqrt(252)
@@ -1424,7 +1492,8 @@ if stock_code:
                 stop_loss_count = (hist_data['风险信号'] == 1).sum()
                 take_profit_count = (hist_data['风险信号'] == 2).sum()
                 drawdown_limit_count = (hist_data['风险信号'] == 3).sum()
-                total_risk_triggers = stop_loss_count + take_profit_count + drawdown_limit_count
+                trailing_stop_count = (hist_data['风险信号'] == 4).sum()
+                total_risk_triggers = stop_loss_count + take_profit_count + drawdown_limit_count + trailing_stop_count
                 
                 col1, col2, col3, col4 = st.columns(4)
                 with col1:
@@ -1451,10 +1520,18 @@ if stock_code:
                 with col4:
                     st.markdown(f"""
                     <div class="metric-card">
-                        <h4 style="color: #ecf0f1; margin: 0 0 0.5rem 0;">风险触发总数</h4>
-                        <p style="color: #9b59b6; font-size: 1.5rem; font-weight: bold; margin: 0;">{total_risk_triggers}</p>
+                        <h4 style="color: #ecf0f1; margin: 0 0 0.5rem 0;">移动止损</h4>
+                        <p style="color: #9b59b6; font-size: 1.5rem; font-weight: bold; margin: 0;">{trailing_stop_count}</p>
                     </div>
                     """, unsafe_allow_html=True)
+                
+                # 风险触发总数
+                st.markdown(f"""
+                <div class="metric-card" style="margin-top: 1rem;">
+                    <h4 style="color: #ecf0f1; margin: 0 0 0.5rem 0;">风险触发总数</h4>
+                    <p style="color: #e67e22; font-size: 1.5rem; font-weight: bold; margin: 0;">{total_risk_triggers}</p>
+                </div>
+                """, unsafe_allow_html=True)
                 
                 # 交易统计
                 st.markdown("""
@@ -1899,6 +1976,8 @@ if stock_code:
                         except Exception as e:
                             st.error(f"生成报告失败: {str(e)}")
                     
+                    # 回测成功完成，重置状态
+                    st.session_state.run_backtest = False
                 
             except Exception as e:
                 st.error(f"策略回测失败: {str(e)}")
@@ -1907,6 +1986,9 @@ if stock_code:
                 st.error("2. 尝试更换股票代码")
                 st.error("3. 减少回测年数")
                 st.error("4. 关闭基本面过滤和蒙特卡洛模拟")
+            finally:
+                # 重置回测状态
+                st.session_state.run_backtest = False
     else:
         st.markdown("""
         <div style="background: linear-gradient(135deg, #f39c12 0%, #e67e22 100%); padding: 2rem; border-radius: 15px; margin: 2rem 0; text-align: center;">
