@@ -16,10 +16,14 @@ import requests
 import json
 warnings.filterwarnings('ignore')
 
-# Tushare配置
-TUSHARE_TOKEN = "24da0172cad3d5fd1d40cbcb7049c6f69ad4230d707ead59324f25bf"
-ts.set_token(TUSHARE_TOKEN)
-pro = ts.pro_api()
+# Tushare配置 - 使用环境变量保护token
+TUSHARE_TOKEN = os.environ.get('TUSHARE_TOKEN', '')
+if TUSHARE_TOKEN:
+    ts.set_token(TUSHARE_TOKEN)
+    pro = ts.pro_api()
+else:
+    st.warning("⚠️ 未设置TUSHARE_TOKEN环境变量，将使用模拟数据")
+    pro = None
 
 # 完全禁用代理设置，解决网络连接问题
 os.environ['HTTP_PROXY'] = ''
@@ -82,6 +86,14 @@ def get_real_fundamental_data(stock_code):
             ts_code = stock_code
         
         # 使用财务指标接口获取数据
+        if pro is None:
+            return {
+                'roe': 15.0,
+                'revenue_growth': 10.0,
+                'profit_growth': 15.0,
+                'cash_flow': 1.0
+            }
+        
         indi = pro.fina_indicator(ts_code=ts_code)
         
         if indi is not None and not indi.empty:
@@ -180,25 +192,26 @@ def get_realtime_data_with_retry(stock_code, max_retries=3, timeout=10):
     }
     
     # 1) 优先：Tushare 实时数据
-    for attempt in range(max_retries):
-        try:
-            # 转换股票代码格式
-            if stock_code.startswith('0') or stock_code.startswith('3'):
-                ts_code = f"{stock_code}.SZ"
-            elif stock_code.startswith('6'):
-                ts_code = f"{stock_code}.SH"
-            else:
-                ts_code = stock_code
-            
-            # 获取最近交易日数据（避免周末/节假日无数据问题）
-            today = datetime.now()
-            # 获取最近5个交易日的数据，然后取最新的
-            start_date = (today - timedelta(days=7)).strftime('%Y%m%d')
-            end_date = today.strftime('%Y%m%d')
-            data = pro.daily(ts_code=ts_code, 
-                           start_date=start_date, 
-                           end_date=end_date,
-                           fields='ts_code,trade_date,open,high,low,close,vol,amount,pct_chg')
+    if pro is not None:
+        for attempt in range(max_retries):
+            try:
+                # 转换股票代码格式
+                if stock_code.startswith('0') or stock_code.startswith('3'):
+                    ts_code = f"{stock_code}.SZ"
+                elif stock_code.startswith('6'):
+                    ts_code = f"{stock_code}.SH"
+                else:
+                    ts_code = stock_code
+                
+                # 获取最近交易日数据（避免周末/节假日无数据问题）
+                today = datetime.now()
+                # 获取最近5个交易日的数据，然后取最新的
+                start_date = (today - timedelta(days=7)).strftime('%Y%m%d')
+                end_date = today.strftime('%Y%m%d')
+                data = pro.daily(ts_code=ts_code, 
+                               start_date=start_date, 
+                               end_date=end_date,
+                               fields='ts_code,trade_date,open,high,low,close,vol,amount,pct_chg')
             
             # 如果有数据，取最新的交易日数据
             if data is not None and not data.empty:
@@ -245,21 +258,22 @@ def get_stock_data_with_retry(stock_code, start_date, end_date, max_retries=2):
     """多源历史数据获取：Tushare → 模拟数据"""
     
     # 1) 优先：Tushare
-    for attempt in range(max_retries):
-        try:
-            # 转换股票代码格式 (如: 000001 -> 000001.SZ)
-            if stock_code.startswith('0') or stock_code.startswith('3'):
-                ts_code = f"{stock_code}.SZ"
-            elif stock_code.startswith('6'):
-                ts_code = f"{stock_code}.SH"
-            else:
-                ts_code = stock_code
-            
-            # 获取日线数据（添加fields参数提高效率）
-            data = pro.daily(ts_code=ts_code, 
-                                     start_date=start_date.strftime('%Y%m%d'),
-                                     end_date=end_date.strftime('%Y%m%d'),
-                                     fields='ts_code,trade_date,open,high,low,close,vol,amount')
+    if pro is not None:
+        for attempt in range(max_retries):
+            try:
+                # 转换股票代码格式 (如: 000001 -> 000001.SZ)
+                if stock_code.startswith('0') or stock_code.startswith('3'):
+                    ts_code = f"{stock_code}.SZ"
+                elif stock_code.startswith('6'):
+                    ts_code = f"{stock_code}.SH"
+                else:
+                    ts_code = stock_code
+                
+                # 获取日线数据（添加fields参数提高效率）
+                data = pro.daily(ts_code=ts_code, 
+                                         start_date=start_date.strftime('%Y%m%d'),
+                                         end_date=end_date.strftime('%Y%m%d'),
+                                         fields='ts_code,trade_date,open,high,low,close,vol,amount')
             
             if data is not None and not data.empty:
                 # 重命名列以匹配原有格式
@@ -345,6 +359,9 @@ def get_index_series(name, start, end):
         
         symbol = INDEX_MAP[name]
         # 使用Tushare获取指数数据（添加fields参数提高效率）
+        if pro is None:
+            return None
+            
         index_data = pro.index_daily(ts_code=symbol, 
                                    start_date=start.strftime('%Y%m%d'), 
                                    end_date=end.strftime('%Y%m%d'),
@@ -471,22 +488,61 @@ def backtest_one(code, params):
                     hist_data.loc[i, '仓位'] = 0.0
                     continue
             
-            # 信号生成（趋势跟踪）
-            if hist_data.loc[i, 'MA_fast'] > hist_data.loc[i, 'MA_slow']:
-                if prev_signal == 0:  # 新开仓
-                    hist_data.loc[i, '信号'] = 1
-                    hist_data.loc[i, '仓位'] = max_position_size
-                    hist_data.loc[i, '买入价格'] = current_price
-                    hist_data.loc[i, '止损价格'] = current_price * (1 - stop_loss)
-                    hist_data.loc[i, '止盈价格'] = current_price * (1 + take_profit)
-                    hist_data.loc[i, '移动止损价格'] = current_price * (1 - 0.1)  # 默认10%移动止损
-                else:  # 保持持仓
-                    hist_data.loc[i, '信号'] = 1
+            # 信号生成（趋势跟踪）- 修复未来函数问题 + 信号确认机制
+            # 使用前一天的均线数据生成当天的信号，并添加信号确认
+            if i > 0:  # 确保有前一天的数据
+                prev_ma_fast = hist_data.loc[i-1, 'MA_fast']
+                prev_ma_slow = hist_data.loc[i-1, 'MA_slow']
+                
+                # 信号确认机制：可配置确认天数
+                confirmation_days = params.get('signal_confirmation_days', 2)
+                enable_confirmation = params.get('enable_signal_confirmation', True)
+                
+                if enable_confirmation and i >= confirmation_days:
+                    # 检查连续N天的信号确认
+                    golden_cross_confirmed = True
+                    death_cross_confirmed = True
+                    
+                    for j in range(confirmation_days):
+                        prev_ma_fast_j = hist_data.loc[i-1-j, 'MA_fast']
+                        prev_ma_slow_j = hist_data.loc[i-1-j, 'MA_slow']
+                        
+                        if not (prev_ma_fast_j > prev_ma_slow_j):
+                            golden_cross_confirmed = False
+                        if not (prev_ma_fast_j < prev_ma_slow_j):
+                            death_cross_confirmed = False
+                else:
+                    # 不使用确认或数据不足，使用简单信号
+                    golden_cross_confirmed = prev_ma_fast > prev_ma_slow
+                    death_cross_confirmed = prev_ma_fast < prev_ma_slow
+                
+                if golden_cross_confirmed:  # 确认金叉
+                    if prev_signal == 0:  # 新开仓
+                        hist_data.loc[i, '信号'] = 1
+                        hist_data.loc[i, '仓位'] = max_position_size
+                        hist_data.loc[i, '买入价格'] = current_price
+                        hist_data.loc[i, '止损价格'] = current_price * (1 - stop_loss)
+                        hist_data.loc[i, '止盈价格'] = current_price * (1 + take_profit)
+                        hist_data.loc[i, '移动止损价格'] = current_price * (1 - 0.1)  # 默认10%移动止损
+                    else:  # 保持持仓
+                        hist_data.loc[i, '信号'] = 1
+                        hist_data.loc[i, '仓位'] = prev_position
+                        hist_data.loc[i, '买入价格'] = prev_buy_price
+                        hist_data.loc[i, '止损价格'] = hist_data.loc[i-1, '止损价格']
+                        hist_data.loc[i, '止盈价格'] = hist_data.loc[i-1, '止盈价格']
+                elif death_cross_confirmed:  # 确认死叉
+                    hist_data.loc[i, '信号'] = 0
+                    hist_data.loc[i, '仓位'] = 0.0
+                else:
+                    # 信号不确认，保持前一日状态
+                    hist_data.loc[i, '信号'] = prev_signal
                     hist_data.loc[i, '仓位'] = prev_position
-                    hist_data.loc[i, '买入价格'] = prev_buy_price
-                    hist_data.loc[i, '止损价格'] = hist_data.loc[i-1, '止损价格']
-                    hist_data.loc[i, '止盈价格'] = hist_data.loc[i-1, '止盈价格']
+                    if prev_signal == 1:
+                        hist_data.loc[i, '买入价格'] = prev_buy_price
+                        hist_data.loc[i, '止损价格'] = hist_data.loc[i-1, '止损价格']
+                        hist_data.loc[i, '止盈价格'] = hist_data.loc[i-1, '止盈价格']
             else:
+                # 第一天，无信号
                 hist_data.loc[i, '信号'] = 0
                 hist_data.loc[i, '仓位'] = 0.0
         
@@ -667,6 +723,11 @@ with st.sidebar:
     with col2:
         slow_ma = st.slider("慢速均线周期", 10, 200, 20)
         benchmark_type = st.selectbox("基准类型", ["个股买入持有", "沪深300指数", "中证500指数", "创业板指"])
+    
+    # 新增：信号确认机制
+    enable_signal_confirmation = st.checkbox("🔒 启用信号确认机制", value=True, 
+                                           help="需要连续2天确认信号，减少交易频率和噪音")
+    signal_confirmation_days = st.slider("信号确认天数", 1, 5, 2) if enable_signal_confirmation else 1
     
     # 新增：ATR/布林带参数
     st.markdown("""
@@ -917,16 +978,27 @@ if stock_code:
                                 prev_position = hist_data.loc[i-1, '仓位']
                                 prev_buy_price = hist_data.loc[i-1, '买入价格']
                                 
-                                # 技术面分析
-                                ma_score = 1 if hist_data.loc[i, 'MA_fast'] > hist_data.loc[i, 'MA_slow'] else 0
-                                bb_score = 1 if (current_price > hist_data.loc[i, 'BB_lower'] and 
-                                               current_price < hist_data.loc[i, 'BB_upper']) else 0
-                                # 修复ATR评分逻辑 - 使用当前ATR值与历史平均比较
-                                if i >= 20:  # 确保有足够的历史数据
-                                    atr_avg = hist_data.loc[i-20:i-1, 'ATR'].mean()
-                                    atr_score = 1 if hist_data.loc[i, 'ATR'] > atr_avg else 0
+                                # 技术面分析 - 修复未来函数问题，使用前一天数据
+                                if i > 0:  # 确保有前一天的数据
+                                    prev_ma_fast = hist_data.loc[i-1, 'MA_fast']
+                                    prev_ma_slow = hist_data.loc[i-1, 'MA_slow']
+                                    prev_bb_upper = hist_data.loc[i-1, 'BB_upper']
+                                    prev_bb_lower = hist_data.loc[i-1, 'BB_lower']
+                                    prev_atr = hist_data.loc[i-1, 'ATR']
+                                    
+                                    ma_score = 1 if prev_ma_fast > prev_ma_slow else 0
+                                    bb_score = 1 if (current_price > prev_bb_lower and current_price < prev_bb_upper) else 0
+                                    
+                                    # ATR评分逻辑 - 使用前一天ATR值与历史平均比较
+                                    if i >= 20:  # 确保有足够的历史数据
+                                        atr_avg = hist_data.loc[i-20:i-1, 'ATR'].mean()
+                                        atr_score = 1 if prev_atr > atr_avg else 0
+                                    else:
+                                        atr_score = 0  # 数据不足时默认为0
                                 else:
-                                    atr_score = 0  # 数据不足时默认为0
+                                    ma_score = 0
+                                    bb_score = 0
+                                    atr_score = 0
                                 
                                 hist_data.loc[i, '技术面得分'] = (ma_score + bb_score + atr_score) / 3
                                 
@@ -995,14 +1067,30 @@ if stock_code:
                                 
                                 # 信号生成
                                 if signal_type == "金叉死叉":
-                                    # 金叉死叉逻辑
+                                    # 金叉死叉逻辑 - 添加信号确认机制
                                     prev_fast = hist_data.loc[i-1, 'MA_fast']
                                     prev_slow = hist_data.loc[i-1, 'MA_slow']
-                                    curr_fast = hist_data.loc[i, 'MA_fast']
-                                    curr_slow = hist_data.loc[i, 'MA_slow']
                                     
-                                    buy_condition = (prev_fast <= prev_slow) and (curr_fast > curr_slow)
-                                    sell_condition = (prev_fast >= prev_slow) and (curr_fast < curr_slow)
+                                    # 信号确认机制：可配置确认天数
+                                    confirmation_days = signal_confirmation_days if enable_signal_confirmation else 1
+                                    
+                                    if enable_signal_confirmation and i >= confirmation_days:
+                                        # 检查连续N天的信号确认
+                                        buy_condition = True
+                                        sell_condition = True
+                                        
+                                        for j in range(confirmation_days):
+                                            prev_fast_j = hist_data.loc[i-1-j, 'MA_fast']
+                                            prev_slow_j = hist_data.loc[i-1-j, 'MA_slow']
+                                            
+                                            if not (prev_fast_j > prev_slow_j):
+                                                buy_condition = False
+                                            if not (prev_fast_j < prev_slow_j):
+                                                sell_condition = False
+                                    else:
+                                        # 不使用确认或数据不足，使用简单信号
+                                        buy_condition = prev_fast > prev_slow
+                                        sell_condition = prev_fast < prev_slow
                                     
                                     if buy_condition and hist_data.loc[i, '综合得分'] >= 0.5:
                                         hist_data.loc[i, '信号'] = 1
@@ -1031,8 +1119,19 @@ if stock_code:
                                         hist_data.loc[i, '移动止损价格'] = hist_data.loc[i-1, '移动止损价格']
                                 
                                 elif signal_type == "趋势跟踪":
-                                    # 趋势跟踪逻辑
-                                    if hist_data.loc[i, 'MA_fast'] > hist_data.loc[i, 'MA_slow'] and hist_data.loc[i, '综合得分'] >= 0.5:
+                                    # 趋势跟踪逻辑 - 添加信号确认机制
+                                    # 使用前一天的技术面得分和均线数据
+                                    if i > 0:
+                                        prev_ma_fast = hist_data.loc[i-1, 'MA_fast']
+                                        prev_ma_slow = hist_data.loc[i-1, 'MA_slow']
+                                        prev_tech_score = hist_data.loc[i-1, '技术面得分']
+                                        
+                                        # 信号确认：前一天技术面得分高且均线金叉
+                                        trend_confirmed = (prev_ma_fast > prev_ma_slow) and (prev_tech_score >= 0.5)
+                                    else:
+                                        trend_confirmed = False
+                                    
+                                    if trend_confirmed:
                                         if prev_signal == 0:  # 新开仓
                                             hist_data.loc[i, '信号'] = 1
                                             if position_sizing_method == "Kelly公式":
