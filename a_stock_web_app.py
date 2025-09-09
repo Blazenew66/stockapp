@@ -29,11 +29,15 @@ import requests
 import json
 warnings.filterwarnings('ignore')
 
-# Tushare配置 - 直接使用token获取真实数据
-TUSHARE_TOKEN = "24da0172cad3d5fd1d40cbcb7049c6f69ad4230d707ead59324f25bf"
-ts.set_token(TUSHARE_TOKEN)
-pro = ts.pro_api()
-st.success("✅ 已连接Tushare，使用真实数据")
+# Tushare配置 - 使用环境变量保护token
+TUSHARE_TOKEN = os.environ.get('TUSHARE_TOKEN', '')
+if TUSHARE_TOKEN:
+    ts.set_token(TUSHARE_TOKEN)
+    pro = ts.pro_api()
+    st.success("✅ 已连接Tushare，使用真实数据")
+else:
+    st.error("❌ 未找到TUSHARE_TOKEN环境变量，请检查.env文件")
+    pro = None
 
 # 完全禁用代理设置，解决网络连接问题
 os.environ['HTTP_PROXY'] = ''
@@ -96,6 +100,14 @@ def get_real_fundamental_data(stock_code):
             ts_code = stock_code
         
         # 使用财务指标接口获取数据
+        if pro is None:
+            return {
+                'roe': 15.0,
+                'revenue_growth': 10.0,
+                'profit_growth': 15.0,
+                'cash_flow': 1.0
+            }
+        
         indi = pro.fina_indicator(ts_code=ts_code)
         
         if indi is not None and not indi.empty:
@@ -350,7 +362,8 @@ def get_realtime_data_with_retry(stock_code, max_retries=3, timeout=10):
     }
     
     # 1) 优先：Tushare 实时数据
-    for attempt in range(max_retries):
+    if pro is not None:
+        for attempt in range(max_retries):
             try:
                 # 转换股票代码格式
                 if stock_code.startswith('0') or stock_code.startswith('3'):
@@ -415,7 +428,8 @@ def get_stock_data_with_retry(stock_code, start_date, end_date, max_retries=2):
     """多源历史数据获取：Tushare → 模拟数据"""
     
     # 1) 优先：Tushare
-    for attempt in range(max_retries):
+    if pro is not None:
+        for attempt in range(max_retries):
             try:
                 # 转换股票代码格式 (如: 000001 -> 000001.SZ)
                 if stock_code.startswith('0') or stock_code.startswith('3'):
@@ -515,6 +529,9 @@ def get_index_series(name, start, end):
         
         symbol = INDEX_MAP[name]
         # 使用Tushare获取指数数据（添加fields参数提高效率）
+        if pro is None:
+            return None
+            
         index_data = pro.index_daily(ts_code=symbol, 
                                    start_date=start.strftime('%Y%m%d'), 
                                    end_date=end.strftime('%Y%m%d'),
