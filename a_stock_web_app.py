@@ -1,6 +1,15 @@
 # -*- coding: utf-8 -*-
 # Updated: 2024-01-25
 import streamlit as st
+
+# 设置页面配置 - 必须在所有其他Streamlit命令之前
+st.set_page_config(
+    page_title="悦北 智能盯盘助手",
+    page_icon="✨",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
 import tushare as ts
 import pandas as pd
 import numpy as np
@@ -9,6 +18,10 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import warnings
 import os
+from dotenv import load_dotenv
+
+# 加载.env文件（如果存在）
+load_dotenv()
 import time
 import signal
 import platform
@@ -16,14 +29,11 @@ import requests
 import json
 warnings.filterwarnings('ignore')
 
-# Tushare配置 - 使用环境变量保护token
-TUSHARE_TOKEN = os.environ.get('TUSHARE_TOKEN', '')
-if TUSHARE_TOKEN:
-    ts.set_token(TUSHARE_TOKEN)
-    pro = ts.pro_api()
-else:
-    st.warning("⚠️ 未设置TUSHARE_TOKEN环境变量，将使用模拟数据")
-    pro = None
+# Tushare配置 - 直接使用token获取真实数据
+TUSHARE_TOKEN = "24da0172cad3d5fd1d40cbcb7049c6f69ad4230d707ead59324f25bf"
+ts.set_token(TUSHARE_TOKEN)
+pro = ts.pro_api()
+st.success("✅ 已连接Tushare，使用真实数据")
 
 # 完全禁用代理设置，解决网络连接问题
 os.environ['HTTP_PROXY'] = ''
@@ -86,14 +96,6 @@ def get_real_fundamental_data(stock_code):
             ts_code = stock_code
         
         # 使用财务指标接口获取数据
-        if pro is None:
-            return {
-                'roe': 15.0,
-                'revenue_growth': 10.0,
-                'profit_growth': 15.0,
-                'cash_flow': 1.0
-            }
-        
         indi = pro.fina_indicator(ts_code=ts_code)
         
         if indi is not None and not indi.empty:
@@ -169,6 +171,162 @@ def calculate_position_size(method, win_rate=0.5, avg_win=0.1, avg_loss=0.05, ri
     else:  # 固定比例
         return capital * 0.5  # 默认50%仓位
 
+def calculate_relative_performance_analysis(strategy_returns, benchmark_returns):
+    """计算相对基准的绩效分析"""
+    try:
+        # 确保数据长度一致
+        min_len = min(len(strategy_returns), len(benchmark_returns))
+        strategy_returns = strategy_returns[:min_len]
+        benchmark_returns = benchmark_returns[:min_len]
+        
+        # 计算超额收益
+        excess_returns = strategy_returns - benchmark_returns
+        
+        # 基本信息
+        strategy_annual_return = (1 + strategy_returns.mean()) ** 252 - 1
+        benchmark_annual_return = (1 + benchmark_returns.mean()) ** 252 - 1
+        excess_annual_return = strategy_annual_return - benchmark_annual_return
+        
+        # 信息比率 (Information Ratio)
+        excess_volatility = excess_returns.std() * np.sqrt(252)
+        information_ratio = excess_annual_return / excess_volatility if excess_volatility > 0 else 0
+        
+        # Beta系数 (市场敏感度)
+        if len(strategy_returns) > 1 and benchmark_returns.std() > 0:
+            beta = np.cov(strategy_returns, benchmark_returns)[0, 1] / np.var(benchmark_returns)
+        else:
+            beta = 1.0
+        
+        # Alpha (超额收益)
+        alpha = excess_annual_return - (beta - 1) * benchmark_annual_return
+        
+        # 跟踪误差 (Tracking Error)
+        tracking_error = excess_returns.std() * np.sqrt(252)
+        
+        # 相关性
+        correlation = np.corrcoef(strategy_returns, benchmark_returns)[0, 1] if len(strategy_returns) > 1 else 0
+        
+        # 胜率分析
+        strategy_win_rate = (strategy_returns > 0).mean()
+        benchmark_win_rate = (benchmark_returns > 0).mean()
+        excess_win_rate = (excess_returns > 0).mean()
+        
+        return {
+            'strategy_annual_return': strategy_annual_return,
+            'benchmark_annual_return': benchmark_annual_return,
+            'excess_annual_return': excess_annual_return,
+            'information_ratio': information_ratio,
+            'beta': beta,
+            'alpha': alpha,
+            'tracking_error': tracking_error,
+            'correlation': correlation,
+            'strategy_win_rate': strategy_win_rate,
+            'benchmark_win_rate': benchmark_win_rate,
+            'excess_win_rate': excess_win_rate
+        }
+    except Exception as e:
+        return None
+
+def rolling_window_validation(stock_codes, params, window_months=12, step_months=3):
+    """滚动窗口验证，测试策略在不同时间窗口的稳定性"""
+    try:
+        results = []
+        
+        for stock_code in stock_codes:
+            # 获取股票数据
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=365*3)  # 3年数据
+            
+            hist_data = get_stock_data_with_retry(stock_code, start_date, end_date)
+            if hist_data is None or hist_data.empty:
+                continue
+            
+            # 转换为datetime
+            hist_data['日期'] = pd.to_datetime(hist_data['日期'])
+            hist_data = hist_data.sort_values('日期').reset_index(drop=True)
+            
+            # 滚动窗口测试
+            total_months = (hist_data['日期'].iloc[-1] - hist_data['日期'].iloc[0]).days // 30
+            
+            for start_month in range(0, total_months - window_months, step_months):
+                # 计算窗口日期
+                window_start = hist_data['日期'].iloc[0] + timedelta(days=start_month*30)
+                window_end = window_start + timedelta(days=window_months*30)
+                
+                # 筛选窗口数据
+                window_data = hist_data[
+                    (hist_data['日期'] >= window_start) & 
+                    (hist_data['日期'] <= window_end)
+                ].copy()
+                
+                if len(window_data) < 50:  # 数据不足
+                    continue
+                
+                # 在窗口内回测
+                result = backtest_one(stock_code, params)
+                if result:
+                    result['window_start'] = window_start
+                    result['window_end'] = window_end
+                    result['window_length'] = window_months
+                    results.append(result)
+        
+        return results
+    except Exception as e:
+        return []
+
+def multi_stock_validation(stock_codes, params):
+    """多股票验证，测试策略在不同股票上的泛化能力"""
+    try:
+        results = []
+        
+        for stock_code in stock_codes:
+            result = backtest_one(stock_code, params)
+            if result:
+                results.append(result)
+        
+        return results
+    except Exception as e:
+        return []
+
+def calculate_strategy_robustness(results):
+    """计算策略鲁棒性指标"""
+    if not results:
+        return None
+    
+    try:
+        # 提取关键指标
+        returns = [r['年化收益'] for r in results]
+        sharpe_ratios = [r['夏普比率'] for r in results]
+        max_drawdowns = [r['最大回撤'] for r in results]
+        
+        # 计算统计指标
+        return_mean = np.mean(returns)
+        return_std = np.std(returns)
+        return_cv = return_std / abs(return_mean) if return_mean != 0 else float('inf')
+        
+        sharpe_mean = np.mean(sharpe_ratios)
+        sharpe_std = np.std(sharpe_ratios)
+        
+        # 胜率统计
+        positive_returns = sum(1 for r in returns if r > 0)
+        win_rate = positive_returns / len(returns)
+        
+        # 稳定性评分
+        stability_score = 1 / (1 + return_cv)  # 变异系数越小，稳定性越高
+        
+        return {
+            'return_mean': return_mean,
+            'return_std': return_std,
+            'return_cv': return_cv,
+            'sharpe_mean': sharpe_mean,
+            'sharpe_std': sharpe_std,
+            'win_rate': win_rate,
+            'stability_score': stability_score,
+            'total_tests': len(results)
+        }
+    except Exception as e:
+        return None
+
 @st.cache_data(ttl=5)
 def get_realtime_data_with_retry(stock_code, max_retries=3, timeout=10):
     """实时数据获取：优先 Tushare，备用新浪，带重试和明确告警"""
@@ -192,8 +350,7 @@ def get_realtime_data_with_retry(stock_code, max_retries=3, timeout=10):
     }
     
     # 1) 优先：Tushare 实时数据
-    if pro is not None:
-        for attempt in range(max_retries):
+    for attempt in range(max_retries):
             try:
                 # 转换股票代码格式
                 if stock_code.startswith('0') or stock_code.startswith('3'):
@@ -213,21 +370,21 @@ def get_realtime_data_with_retry(stock_code, max_retries=3, timeout=10):
                                end_date=end_date,
                                fields='ts_code,trade_date,open,high,low,close,vol,amount,pct_chg')
             
-            # 如果有数据，取最新的交易日数据
-            if data is not None and not data.empty:
-                data = data.sort_values('trade_date', ascending=False)
-                row = data.iloc[0]  # 取最新一条
-                return {
-                    '最新价': float(row.get('close', 0) or 0),
-                    '涨跌幅': float(row.get('pct_chg', 0) or 0),
-                    '成交量': int(row.get('vol', 0) or 0),
-                    '成交额': float(row.get('amount', 0) or 0)
-                }
-            
-            st.info(f"Tushare未找到今日数据 {stock_code}，尝试备用源 (第{attempt+1}次)")
-        except Exception as e:
-            st.warning(f"Tushare 实时数据失败(第{attempt+1}次): {str(e)}")
-        time.sleep(0.5)
+                # 如果有数据，取最新的交易日数据
+                if data is not None and not data.empty:
+                    data = data.sort_values('trade_date', ascending=False)
+                    row = data.iloc[0]  # 取最新一条
+                    return {
+                        '最新价': float(row.get('close', 0) or 0),
+                        '涨跌幅': float(row.get('pct_chg', 0) or 0),
+                        '成交量': int(row.get('vol', 0) or 0),
+                        '成交额': float(row.get('amount', 0) or 0)
+                    }
+                
+                st.info(f"Tushare未找到今日数据 {stock_code}，尝试备用源 (第{attempt+1}次)")
+            except Exception as e:
+                st.warning(f"Tushare 实时数据失败(第{attempt+1}次): {str(e)}")
+            time.sleep(0.5)
     
     # 2) 备用：新浪简易接口（gbk 编码）
     try:
@@ -258,8 +415,7 @@ def get_stock_data_with_retry(stock_code, start_date, end_date, max_retries=2):
     """多源历史数据获取：Tushare → 模拟数据"""
     
     # 1) 优先：Tushare
-    if pro is not None:
-        for attempt in range(max_retries):
+    for attempt in range(max_retries):
             try:
                 # 转换股票代码格式 (如: 000001 -> 000001.SZ)
                 if stock_code.startswith('0') or stock_code.startswith('3'):
@@ -274,33 +430,33 @@ def get_stock_data_with_retry(stock_code, start_date, end_date, max_retries=2):
                                          start_date=start_date.strftime('%Y%m%d'),
                                          end_date=end_date.strftime('%Y%m%d'),
                                          fields='ts_code,trade_date,open,high,low,close,vol,amount')
-            
-            if data is not None and not data.empty:
-                # 重命名列以匹配原有格式
-                data = data.rename(columns={
-                    'trade_date': '日期',
-                    'open': '开盘',
-                    'high': '最高', 
-                    'low': '最低',
-                    'close': '收盘',
-                    'vol': '成交量'
-                })
                 
-                # 转换日期格式
-                data['日期'] = pd.to_datetime(data['日期'], format='%Y%m%d').dt.strftime('%Y-%m-%d')
+                if data is not None and not data.empty:
+                    # 重命名列以匹配原有格式
+                    data = data.rename(columns={
+                        'trade_date': '日期',
+                        'open': '开盘',
+                        'high': '最高', 
+                        'low': '最低',
+                        'close': '收盘',
+                        'vol': '成交量'
+                    })
                 
-                # 按日期排序
-                data = data.sort_values('日期').reset_index(drop=True)
+                    # 转换日期格式
+                    data['日期'] = pd.to_datetime(data['日期'], format='%Y%m%d').dt.strftime('%Y-%m-%d')
+                    
+                    # 按日期排序
+                    data = data.sort_values('日期').reset_index(drop=True)
+                    
+                    required_cols = ['日期', '开盘', '最高', '最低', '收盘', '成交量']
+                    if all(col in data.columns for col in required_cols):
+                        st.success(f"✅ Tushare数据获取成功: {stock_code}")
+                        return data
                 
-                required_cols = ['日期', '开盘', '最高', '最低', '收盘', '成交量']
-                if all(col in data.columns for col in required_cols):
-                    st.success(f"✅ Tushare数据获取成功: {stock_code}")
-                    return data
-            
-            st.info(f"Tushare数据获取失败(第{attempt+1}次)，尝试备用源...")
-        except Exception as e:
-            st.warning(f"Tushare失败(第{attempt+1}次): {str(e)}")
-        time.sleep(0.5)
+                st.info(f"Tushare数据获取失败(第{attempt+1}次)，尝试备用源...")
+            except Exception as e:
+                st.warning(f"Tushare失败(第{attempt+1}次): {str(e)}")
+            time.sleep(0.5)
     
     # 2) 兜底：模拟数据
     st.warning("Tushare数据源失败，使用模拟数据进行演示")
@@ -359,9 +515,6 @@ def get_index_series(name, start, end):
         
         symbol = INDEX_MAP[name]
         # 使用Tushare获取指数数据（添加fields参数提高效率）
-        if pro is None:
-            return None
-            
         index_data = pro.index_daily(ts_code=symbol, 
                                    start_date=start.strftime('%Y%m%d'), 
                                    end_date=end.strftime('%Y%m%d'),
@@ -467,6 +620,7 @@ def backtest_one(code, params):
         hist_data['买入价格'] = 0.0
         hist_data['止损价格'] = 0.0
         hist_data['止盈价格'] = 0.0
+        hist_data['风险信号'] = 0  # 添加风险信号列
         
         # 简化策略执行（趋势跟踪）
         for i in range(1, len(hist_data)):
@@ -477,15 +631,18 @@ def backtest_one(code, params):
             
             # 风险管理检查
             if prev_position > 0 and prev_buy_price > 0:
-                # 止损止盈检查
-                if current_price <= hist_data.loc[i-1, '止损价格']:
-                    hist_data.loc[i, '信号'] = 0
-                    hist_data.loc[i, '仓位'] = 0.0
-                    continue
-                
+                # 止盈检查（优先检查止盈）
                 if current_price >= hist_data.loc[i-1, '止盈价格']:
                     hist_data.loc[i, '信号'] = 0
                     hist_data.loc[i, '仓位'] = 0.0
+                    hist_data.loc[i, '风险信号'] = 2  # 止盈
+                    continue
+                
+                # 止损检查
+                if current_price <= hist_data.loc[i-1, '止损价格']:
+                    hist_data.loc[i, '信号'] = 0
+                    hist_data.loc[i, '仓位'] = 0.0
+                    hist_data.loc[i, '风险信号'] = 1  # 止损
                     continue
             
             # 信号生成（趋势跟踪）- 修复未来函数问题 + 信号确认机制
@@ -524,19 +681,23 @@ def backtest_one(code, params):
                         hist_data.loc[i, '止损价格'] = current_price * (1 - stop_loss)
                         hist_data.loc[i, '止盈价格'] = current_price * (1 + take_profit)
                         hist_data.loc[i, '移动止损价格'] = current_price * (1 - 0.1)  # 默认10%移动止损
+                        hist_data.loc[i, '风险信号'] = 0  # 正常开仓
                     else:  # 保持持仓
                         hist_data.loc[i, '信号'] = 1
                         hist_data.loc[i, '仓位'] = prev_position
                         hist_data.loc[i, '买入价格'] = prev_buy_price
                         hist_data.loc[i, '止损价格'] = hist_data.loc[i-1, '止损价格']
                         hist_data.loc[i, '止盈价格'] = hist_data.loc[i-1, '止盈价格']
+                        hist_data.loc[i, '风险信号'] = 0  # 正常持仓
                 elif death_cross_confirmed:  # 确认死叉
                     hist_data.loc[i, '信号'] = 0
                     hist_data.loc[i, '仓位'] = 0.0
+                    hist_data.loc[i, '风险信号'] = 0  # 正常平仓
                 else:
                     # 信号不确认，保持前一日状态
                     hist_data.loc[i, '信号'] = prev_signal
                     hist_data.loc[i, '仓位'] = prev_position
+                    hist_data.loc[i, '风险信号'] = 0  # 保持状态
                     if prev_signal == 1:
                         hist_data.loc[i, '买入价格'] = prev_buy_price
                         hist_data.loc[i, '止损价格'] = hist_data.loc[i-1, '止损价格']
@@ -550,14 +711,18 @@ def backtest_one(code, params):
         hist_data['收益率'] = hist_data['收盘'].pct_change()
         hist_data['策略收益'] = hist_data['信号'].shift(1) * hist_data['收益率'] * hist_data['仓位'].shift(1)
         
-        # 交易成本：按换手×费率计算
-        signal_change = hist_data['信号'].diff().fillna(0)
-        turnover = signal_change.abs() * hist_data['仓位'].shift(1).fillna(0.0)
-        buy = (signal_change == 1)
-        sell = (signal_change == -1)
-        cost_rate = np.where(buy, commission_rate + slippage_rate, 0.0) + \
-                    np.where(sell, commission_rate + slippage_rate + stamp_tax_rate, 0.0)
-        hist_data['交易成本'] = turnover * cost_rate
+        # 交易成本：按实际仓位变化计算换手
+        position_change = hist_data['仓位'].diff().fillna(0.0)
+        
+        # 买入：仓位增加的部分
+        buy_turnover = np.where(position_change > 0, position_change, 0.0)
+        # 卖出：仓位减少的部分
+        sell_turnover = np.where(position_change < 0, -position_change, 0.0)
+        
+        # 计算交易成本
+        buy_cost = buy_turnover * (commission_rate + slippage_rate)
+        sell_cost = sell_turnover * (commission_rate + slippage_rate + stamp_tax_rate)
+        hist_data['交易成本'] = buy_cost + sell_cost
         
         hist_data['策略收益_after_fee'] = hist_data['策略收益'] - hist_data['交易成本']
         hist_data['累计收益'] = (1 + hist_data['策略收益_after_fee']).cumprod()
@@ -601,13 +766,6 @@ def backtest_one(code, params):
     except Exception as e:
         return None
 
-# 设置页面配置 - 专业深色模式
-st.set_page_config(
-    page_title="悦北 智能盯盘助手",
-    page_icon="✨",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
 
 # 自定义CSS样式 - 专业深色模式
 st.markdown("""
@@ -824,6 +982,28 @@ with st.sidebar:
     enable_trailing_stop = st.checkbox("启用移动止损", value=False)
     if enable_trailing_stop:
         trailing_stop_percent = st.number_input("移动止损比例(%)", 5.0, 20.0, 10.0, 0.5) / 100
+    
+    st.markdown("---")
+    
+    # 新增：策略验证选项
+    st.markdown("""
+    <div style="background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%); padding: 1rem; border-radius: 10px; margin-bottom: 1rem;">
+        <h3 style="color: white; text-align: center; margin: 0;">🔬 策略验证</h3>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    enable_strategy_validation = st.checkbox("启用策略验证", value=False, 
+                                           help="进行多股票和滚动窗口验证，测试策略鲁棒性")
+    
+    if enable_strategy_validation:
+        col1, col2 = st.columns(2)
+        with col1:
+            validation_stocks = st.text_area("验证股票列表", value="000001\n000002\n000858\n600036\n600519", 
+                                           placeholder="每行一个股票代码", height=80)
+            validation_stocks = [s.strip() for s in validation_stocks.split('\n') if s.strip()]
+        with col2:
+            window_months = st.slider("滚动窗口(月)", 6, 24, 12)
+            step_months = st.slider("步长(月)", 1, 6, 3)
     
     st.markdown("---")
     
@@ -1196,14 +1376,18 @@ if stock_code:
                         
                         # 计算交易成本和收益
                         hist_data['交易成本'] = 0.0
-                        # 交易成本：按换手×费率计算
-                        signal_change = hist_data['信号'].diff().fillna(0)
-                        turnover = signal_change.abs() * hist_data['仓位'].shift(1).fillna(0.0)
-                        buy = (signal_change == 1)
-                        sell = (signal_change == -1)
-                        cost_rate = np.where(buy, commission_rate + slippage_rate, 0.0) + \
-                                    np.where(sell, commission_rate + slippage_rate + stamp_tax_rate, 0.0)
-                        hist_data['交易成本'] = turnover * cost_rate
+                        # 交易成本：按实际仓位变化计算换手
+                        position_change = hist_data['仓位'].diff().fillna(0.0)
+                        
+                        # 买入：仓位增加的部分
+                        buy_turnover = np.where(position_change > 0, position_change, 0.0)
+                        # 卖出：仓位减少的部分
+                        sell_turnover = np.where(position_change < 0, -position_change, 0.0)
+                        
+                        # 计算交易成本
+                        buy_cost = buy_turnover * (commission_rate + slippage_rate)
+                        sell_cost = sell_turnover * (commission_rate + slippage_rate + stamp_tax_rate)
+                        hist_data['交易成本'] = buy_cost + sell_cost
                 
                 hist_data['收益率'] = hist_data['收盘'].pct_change()
                 hist_data['策略收益'] = hist_data['信号'].shift(1) * hist_data['收益率'] * hist_data['仓位'].shift(1)
@@ -1265,6 +1449,9 @@ if stock_code:
                 avg_win = strategy_returns[strategy_returns > 0].mean() if (strategy_returns > 0).sum() > 0 else 0
                 avg_loss = abs(strategy_returns[strategy_returns < 0].mean()) if (strategy_returns < 0).sum() > 0 else 1
                 profit_loss_ratio = avg_win / avg_loss if avg_loss > 0 else 0
+                
+                # 相对基准分析
+                relative_analysis = calculate_relative_performance_analysis(strategy_returns, benchmark_returns)
                 
                 # 显示策略结果
                 st.markdown("""
@@ -1346,6 +1533,132 @@ if stock_code:
                         <p style="color: #9b59b6; font-size: 1.5rem; font-weight: bold; margin: 0;">{annual_volatility:.2%}</p>
                     </div>
                     """, unsafe_allow_html=True)
+                
+                # 相对基准分析
+                if relative_analysis:
+                    st.markdown("""
+                    <div style="background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%); padding: 1rem; border-radius: 10px; margin: 1rem 0;">
+                        <h3 style="color: white; margin: 0;">📈 相对基准分析</h3>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        excess_color = "#27ae60" if relative_analysis['excess_annual_return'] > 0 else "#e74c3c"
+                        st.markdown(f"""
+                        <div class="metric-card">
+                            <h4 style="color: #ecf0f1; margin: 0 0 0.5rem 0;">超额年化收益</h4>
+                            <p style="color: {excess_color}; font-size: 1.5rem; font-weight: bold; margin: 0;">{relative_analysis['excess_annual_return']:.2%}</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    with col2:
+                        ir_color = "#27ae60" if relative_analysis['information_ratio'] > 0.5 else "#e74c3c" if relative_analysis['information_ratio'] < 0 else "#f39c12"
+                        st.markdown(f"""
+                        <div class="metric-card">
+                            <h4 style="color: #ecf0f1; margin: 0 0 0.5rem 0;">信息比率</h4>
+                            <p style="color: {ir_color}; font-size: 1.5rem; font-weight: bold; margin: 0;">{relative_analysis['information_ratio']:.2f}</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    with col3:
+                        beta_color = "#27ae60" if 0.8 <= relative_analysis['beta'] <= 1.2 else "#f39c12"
+                        st.markdown(f"""
+                        <div class="metric-card">
+                            <h4 style="color: #ecf0f1; margin: 0 0 0.5rem 0;">Beta系数</h4>
+                            <p style="color: {beta_color}; font-size: 1.5rem; font-weight: bold; margin: 0;">{relative_analysis['beta']:.2f}</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    with col4:
+                        alpha_color = "#27ae60" if relative_analysis['alpha'] > 0 else "#e74c3c"
+                        st.markdown(f"""
+                        <div class="metric-card">
+                            <h4 style="color: #ecf0f1; margin: 0 0 0.5rem 0;">Alpha收益</h4>
+                            <p style="color: {alpha_color}; font-size: 1.5rem; font-weight: bold; margin: 0;">{relative_analysis['alpha']:.2%}</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    # 第二行指标
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.markdown(f"""
+                        <div class="metric-card">
+                            <h4 style="color: #ecf0f1; margin: 0 0 0.5rem 0;">跟踪误差</h4>
+                            <p style="color: #9b59b6; font-size: 1.5rem; font-weight: bold; margin: 0;">{relative_analysis['tracking_error']:.2%}</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    with col2:
+                        corr_color = "#27ae60" if relative_analysis['correlation'] > 0.7 else "#f39c12" if relative_analysis['correlation'] > 0.3 else "#e74c3c"
+                        st.markdown(f"""
+                        <div class="metric-card">
+                            <h4 style="color: #ecf0f1; margin: 0 0 0.5rem 0;">相关性</h4>
+                            <p style="color: {corr_color}; font-size: 1.5rem; font-weight: bold; margin: 0;">{relative_analysis['correlation']:.2f}</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    with col3:
+                        st.markdown(f"""
+                        <div class="metric-card">
+                            <h4 style="color: #ecf0f1; margin: 0 0 0.5rem 0;">策略胜率</h4>
+                            <p style="color: #3498db; font-size: 1.5rem; font-weight: bold; margin: 0;">{relative_analysis['strategy_win_rate']:.1%}</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    with col4:
+                        st.markdown(f"""
+                        <div class="metric-card">
+                            <h4 style="color: #ecf0f1; margin: 0 0 0.5rem 0;">基准胜率</h4>
+                            <p style="color: #e67e22; font-size: 1.5rem; font-weight: bold; margin: 0;">{relative_analysis['benchmark_win_rate']:.1%}</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    # 收益来源分析
+                    st.markdown("""
+                    <div style="background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%); padding: 1rem; border-radius: 10px; margin: 1rem 0;">
+                        <h3 style="color: white; margin: 0;">🎯 收益来源分析</h3>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    # 计算收益来源
+                    market_return = relative_analysis['beta'] * relative_analysis['benchmark_annual_return']
+                    alpha_return = relative_analysis['alpha']
+                    total_strategy_return = relative_analysis['strategy_annual_return']
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.markdown(f"""
+                        <div class="metric-card">
+                            <h4 style="color: #ecf0f1; margin: 0 0 0.5rem 0;">市场收益 (β×基准)</h4>
+                            <p style="color: #3498db; font-size: 1.5rem; font-weight: bold; margin: 0;">{market_return:.2%}</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    with col2:
+                        st.markdown(f"""
+                        <div class="metric-card">
+                            <h4 style="color: #ecf0f1; margin: 0 0 0.5rem 0;">策略Alpha</h4>
+                            <p style="color: #27ae60; font-size: 1.5rem; font-weight: bold; margin: 0;">{alpha_return:.2%}</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    with col3:
+                        st.markdown(f"""
+                        <div class="metric-card">
+                            <h4 style="color: #ecf0f1; margin: 0 0 0.5rem 0;">总策略收益</h4>
+                            <p style="color: #f39c12; font-size: 1.5rem; font-weight: bold; margin: 0;">{total_strategy_return:.2%}</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    # 收益来源饼图
+                    if market_return != 0 or alpha_return != 0:
+                        fig_pie = go.Figure(data=[go.Pie(
+                            labels=['市场收益', '策略Alpha'],
+                            values=[abs(market_return), abs(alpha_return)],
+                            hole=0.3,
+                            marker_colors=['#3498db', '#27ae60']
+                        )])
+                        fig_pie.update_layout(
+                            title="收益来源构成",
+                            showlegend=True,
+                            height=400,
+                            paper_bgcolor='rgba(0,0,0,0)',
+                            font=dict(color='white')
+                        )
+                        st.plotly_chart(fig_pie, use_container_width=True)
                 
                 # 风险管理统计
                 st.markdown("""
@@ -1587,50 +1900,6 @@ if stock_code:
                                 
                                 st.plotly_chart(fig_portfolio, use_container_width=True)
                 
-                # 计算风险管理指标
-                stop_loss_count = (hist_data['风险信号'] == 1).sum()
-                take_profit_count = (hist_data['风险信号'] == 2).sum()
-                drawdown_limit_count = (hist_data['风险信号'] == 3).sum()
-                trailing_stop_count = (hist_data['风险信号'] == 4).sum()
-                total_risk_triggers = stop_loss_count + take_profit_count + drawdown_limit_count + trailing_stop_count
-                
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.markdown(f"""
-                    <div class="metric-card">
-                        <h4 style="color: #ecf0f1; margin: 0 0 0.5rem 0;">止损触发</h4>
-                        <p style="color: #e74c3c; font-size: 1.5rem; font-weight: bold; margin: 0;">{stop_loss_count}</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                with col2:
-                    st.markdown(f"""
-                    <div class="metric-card">
-                        <h4 style="color: #ecf0f1; margin: 0 0 0.5rem 0;">止盈触发</h4>
-                        <p style="color: #27ae60; font-size: 1.5rem; font-weight: bold; margin: 0;">{take_profit_count}</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                with col3:
-                    st.markdown(f"""
-                    <div class="metric-card">
-                        <h4 style="color: #ecf0f1; margin: 0 0 0.5rem 0;">回撤限制</h4>
-                        <p style="color: #f39c12; font-size: 1.5rem; font-weight: bold; margin: 0;">{drawdown_limit_count}</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                with col4:
-                    st.markdown(f"""
-                    <div class="metric-card">
-                        <h4 style="color: #ecf0f1; margin: 0 0 0.5rem 0;">移动止损</h4>
-                        <p style="color: #9b59b6; font-size: 1.5rem; font-weight: bold; margin: 0;">{trailing_stop_count}</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                # 风险触发总数
-                st.markdown(f"""
-                <div class="metric-card" style="margin-top: 1rem;">
-                    <h4 style="color: #ecf0f1; margin: 0 0 0.5rem 0;">风险触发总数</h4>
-                    <p style="color: #e67e22; font-size: 1.5rem; font-weight: bold; margin: 0;">{total_risk_triggers}</p>
-                </div>
-                """, unsafe_allow_html=True)
                 
                 # 交易统计
                 st.markdown("""
@@ -2074,6 +2343,93 @@ if stock_code:
                             
                         except Exception as e:
                             st.error(f"生成报告失败: {str(e)}")
+                    
+                    # 策略验证
+                    if enable_strategy_validation and validation_stocks:
+                        st.markdown("""
+                        <div style="background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%); padding: 1rem; border-radius: 10px; margin: 1rem 0;">
+                            <h3 style="color: white; margin: 0;">🔬 策略验证分析</h3>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        with st.spinner("正在进行策略验证..."):
+                            # 多股票验证
+                            multi_stock_results = multi_stock_validation(validation_stocks, params)
+                            
+                            if multi_stock_results:
+                                # 计算鲁棒性指标
+                                robustness = calculate_strategy_robustness(multi_stock_results)
+                                
+                                if robustness:
+                                    # 显示鲁棒性分析
+                                    col1, col2, col3, col4 = st.columns(4)
+                                    with col1:
+                                        st.markdown(f"""
+                                        <div class="metric-card">
+                                            <h4 style="color: #ecf0f1; margin: 0 0 0.5rem 0;">平均年化收益</h4>
+                                            <p style="color: #27ae60; font-size: 1.5rem; font-weight: bold; margin: 0;">{robustness['return_mean']:.2%}</p>
+                                        </div>
+                                        """, unsafe_allow_html=True)
+                                    with col2:
+                                        st.markdown(f"""
+                                        <div class="metric-card">
+                                            <h4 style="color: #ecf0f1; margin: 0 0 0.5rem 0;">收益标准差</h4>
+                                            <p style="color: #e74c3c; font-size: 1.5rem; font-weight: bold; margin: 0;">{robustness['return_std']:.2%}</p>
+                                        </div>
+                                        """, unsafe_allow_html=True)
+                                    with col3:
+                                        st.markdown(f"""
+                                        <div class="metric-card">
+                                            <h4 style="color: #ecf0f1; margin: 0 0 0.5rem 0;">胜率</h4>
+                                            <p style="color: #3498db; font-size: 1.5rem; font-weight: bold; margin: 0;">{robustness['win_rate']:.1%}</p>
+                                        </div>
+                                        """, unsafe_allow_html=True)
+                                    with col4:
+                                        stability_color = "#27ae60" if robustness['stability_score'] > 0.7 else "#f39c12" if robustness['stability_score'] > 0.4 else "#e74c3c"
+                                        st.markdown(f"""
+                                        <div class="metric-card">
+                                            <h4 style="color: #ecf0f1; margin: 0 0 0.5rem 0;">稳定性评分</h4>
+                                            <p style="color: {stability_color}; font-size: 1.5rem; font-weight: bold; margin: 0;">{robustness['stability_score']:.2f}</p>
+                                        </div>
+                                        """, unsafe_allow_html=True)
+                                    
+                                    # 策略评估
+                                    st.markdown("""
+                                    <div style="background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%); padding: 1rem; border-radius: 10px; margin: 1rem 0;">
+                                        <h3 style="color: white; margin: 0;">📊 策略评估</h3>
+                                    </div>
+                                    """, unsafe_allow_html=True)
+                                    
+                                    # 评估标准
+                                    if robustness['stability_score'] > 0.7 and robustness['win_rate'] > 0.6:
+                                        st.success("✅ 策略表现优秀：高稳定性 + 高胜率")
+                                    elif robustness['stability_score'] > 0.4 and robustness['win_rate'] > 0.5:
+                                        st.warning("⚠️ 策略表现一般：中等稳定性 + 中等胜率")
+                                    else:
+                                        st.error("❌ 策略表现较差：低稳定性或低胜率")
+                                    
+                                    # 详细分析
+                                    st.markdown(f"""
+                                    **验证结果分析：**
+                                    - 测试股票数量：{robustness['total_tests']}只
+                                    - 平均年化收益：{robustness['return_mean']:.2%}
+                                    - 收益波动率：{robustness['return_std']:.2%}
+                                    - 变异系数：{robustness['return_cv']:.2f}
+                                    - 胜率：{robustness['win_rate']:.1%}
+                                    - 稳定性评分：{robustness['stability_score']:.2f}
+                                    """)
+                                    
+                                    # 建议
+                                    if robustness['return_cv'] > 1.0:
+                                        st.warning("⚠️ 收益波动较大，建议优化参数或增加信号确认")
+                                    if robustness['win_rate'] < 0.5:
+                                        st.warning("⚠️ 胜率较低，建议调整止损止盈参数")
+                                    if robustness['stability_score'] < 0.4:
+                                        st.warning("⚠️ 稳定性较差，建议进行更多股票验证")
+                                else:
+                                    st.error("策略验证失败，无法计算鲁棒性指标")
+                            else:
+                                st.warning("策略验证失败，无法获取多股票回测结果")
                     
                     # 回测成功完成，重置状态
                     st.session_state.run_backtest = False
